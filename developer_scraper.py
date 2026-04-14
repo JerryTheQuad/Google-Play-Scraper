@@ -2,8 +2,7 @@
 import asyncio
 from playwright.async_api import async_playwright
 from loguru import logger
-import re
-from database import get_known_apps_global, save_new_app
+from database import get_known_apps, save_new_app
 from notifier import send_notification
 
 BAD_TITLE_MARKERS = {
@@ -17,15 +16,6 @@ BAD_TITLE_MARKERS = {
 def _is_bad_title(value: str) -> bool:
     normalized = " ".join(value.lower().split())
     return not normalized or normalized in BAD_TITLE_MARKERS
-
-
-def _clean_title(value: str) -> str:
-    cleaned = value.strip()
-    # Часто Google Play отдаёт alt вроде: `Значок приложения "App Name"`
-    cleaned = re.sub(r'^\s*значок приложения\s*["“]?', "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r'^\s*app icon\s*["“]?', "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = cleaned.rstrip('"”').strip()
-    return cleaned
 
 
 async def _extract_app_title(link):
@@ -45,10 +35,8 @@ async def _extract_app_title(link):
 
         for attr in ("alt", "aria-label", "title"):
             value = await candidate_locator.get_attribute(attr)
-            if value:
-                cleaned = _clean_title(value)
-                if cleaned and not _is_bad_title(cleaned):
-                    return cleaned
+            if value and not _is_bad_title(value.strip()):
+                return value.strip()
 
     # 2) Заголовки и текстовые узлы карточки
     text_candidates = await link.locator(
@@ -56,7 +44,7 @@ async def _extract_app_title(link):
     ).all_inner_texts()
 
     for value in text_candidates:
-        cleaned = _clean_title(value)
+        cleaned = value.strip()
         if len(cleaned) >= 2 and not _is_bad_title(cleaned):
             return cleaned
 
@@ -66,9 +54,8 @@ async def _extract_app_title(link):
         all_text = await card.inner_text()
         lines = [line.strip() for line in all_text.split("\n") if line.strip()]
         for line in lines:
-            cleaned = _clean_title(line)
-            if len(cleaned) >= 2 and not _is_bad_title(cleaned):
-                return cleaned
+            if len(line) >= 2 and not _is_bad_title(line):
+                return line
 
     return "Без названия"
 
@@ -147,14 +134,9 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
 
         deduplicated_apps = sorted(unique_apps.values(), key=lambda app: app["app_id"])
 
-        # Сравнение с БД без привязки к стране:
-        # если app_id уже был в любой стране у этого издателя, повторно в Telegram не шлём.
-        known_global = get_known_apps_global(developer_id)
-        new_apps = [app for app in deduplicated_apps if app["app_id"] not in known_global]
-
-        # Обновляем БД по текущей стране для всех найденных app_id
-        for app in deduplicated_apps:
-            save_new_app(developer_id, country, app["app_id"], app["title"])
+        # Сравнение с БД
+        known = get_known_apps(developer_id, country)
+        new_apps = [app for app in deduplicated_apps if app["app_id"] not in known]
 
         if new_apps:
             logger.success(f"✅ НАЙДЕНО НОВЫХ приложений у {developer_id} ({country}): {len(new_apps)} (всего уникальных: {len(deduplicated_apps)})")
@@ -163,6 +145,7 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
                 if app["app_id"] in notified_ids:
                     continue
 
+                save_new_app(developer_id, country, app["app_id"], app["title"])
                 send_notification(
                     f"🆕 **Новая игра от издателя**\n"
                     f"Издатель: {developer_id}\n"
