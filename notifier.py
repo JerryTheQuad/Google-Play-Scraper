@@ -3,8 +3,8 @@ import requests
 from loguru import logger
 
 # Эти переменные будут импортироваться из config.py
-TELEGRAM_BOT_TOKEN = "8678375056:AAGxkGR7ZjDmCtOIGV_kYPlVh4pJqZPB5Ws"
-TELEGRAM_CHAT_ID = "703529738"
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
 
 def send_notification(text: str):
     """Отправляет сообщение в Telegram"""
