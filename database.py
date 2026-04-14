@@ -31,6 +31,21 @@ def get_known_apps(developer_id: str, country: str):
     conn.close()
     return known
 
+
+def get_known_apps_global(developer_id: str):
+    """
+    Возвращает app_id, которые уже встречались у издателя
+    в любой стране.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "SELECT DISTINCT app_id FROM apps WHERE developer_id = ?",
+        (developer_id,)
+    )
+    known = {row[0] for row in cursor.fetchall()}
+    conn.close()
+    return known
+
 def save_new_app(developer_id: str, country: str, app_id: str, title: str):
     conn = sqlite3.connect(DB_PATH)
     now = datetime.now().isoformat()
