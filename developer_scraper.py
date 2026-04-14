@@ -3,10 +3,82 @@ import asyncio
 from playwright.async_api import async_playwright
 from loguru import logger
 import re
-from database import get_known_apps, save_new_app
+from database import reserve_notification, save_new_app
 from notifier import send_notification
 
-# developer_scraper.py — обновлённая функция
+BAD_TITLE_MARKERS = {
+    "покупки в приложении",
+    "in-app purchases",
+    "contains ads",
+    "реклама",
+}
+
+
+def _is_bad_title(value: str) -> bool:
+    normalized = " ".join(value.lower().split())
+    return not normalized or normalized in BAD_TITLE_MARKERS
+
+
+def _clean_title(value: str) -> str:
+    cleaned = value.strip()
+    # Если есть кавычки, часто именно там лежит реальное название.
+    quoted = re.search(r'["“](.+?)["”]', cleaned)
+    if quoted and quoted.group(1).strip():
+        cleaned = quoted.group(1).strip()
+
+    # Часто Google Play отдаёт alt вроде: `Значок приложения App Name`
+    cleaned = re.sub(r'\bзначок приложения\b', "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r'\bapp icon\b', "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.rstrip('"”').strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
+async def _extract_app_title(link):
+    """
+    Извлекает название приложения из карточки.
+    В Google Play часто попадается служебный текст (например, "Покупки в приложении"),
+    поэтому фильтруем такие значения и ищем более надёжные источники.
+    """
+    # 1) Самые надёжные варианты атрибутов/тегов
+    for candidate_locator in [
+        link.locator("img[alt]").first,
+        link.locator("[aria-label]").first,
+        link.locator("[title]").first,
+    ]:
+        if await candidate_locator.count() == 0:
+            continue
+
+        for attr in ("alt", "aria-label", "title"):
+            value = await candidate_locator.get_attribute(attr)
+            if value:
+                cleaned = _clean_title(value)
+                if cleaned and not _is_bad_title(cleaned):
+                    return cleaned
+
+    # 2) Заголовки и текстовые узлы карточки
+    text_candidates = await link.locator(
+        "span, div, h2, h3, [role='heading']"
+    ).all_inner_texts()
+
+    for value in text_candidates:
+        cleaned = _clean_title(value)
+        if len(cleaned) >= 2 and not _is_bad_title(cleaned):
+            return cleaned
+
+    # 3) Fallback: любой текст карточки, но с фильтрацией служебных фраз
+    card = link.locator("xpath=ancestor::div[contains(@class, 'VfPpkd') or contains(@class, 'Si6A0c') or contains(@class, 'card') or contains(@class, 'item')]").first
+    if await card.count() > 0:
+        all_text = await card.inner_text()
+        lines = [line.strip() for line in all_text.split("\n") if line.strip()]
+        for line in lines:
+            cleaned = _clean_title(line)
+            if len(cleaned) >= 2 and not _is_bad_title(cleaned):
+                return cleaned
+
+    return "Без названия"
+
+
 async def scrape_developer_page(developer_id: str, country: str, lang: str, semaphore: asyncio.Semaphore):
     async with semaphore:
         developer_id = developer_id.strip().replace(" ", "+")
@@ -55,32 +127,7 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
                         if not app_id:
                             continue
 
-                        # === Надёжное извлечение названия ===
-                        title = "Без названия"
-                        
-                        # Вариант 1: ищем внутри самой ссылки (часто название в span)
-                        title_elem = link.locator("span, div").filter(has_text=True).first
-                        if await title_elem.count() > 0:
-                            title_text = await title_elem.inner_text()
-                            if title_text.strip():
-                                title = title_text.strip()
-                        
-                        # Вариант 2: fallback — ближайший видимый текст с ролью heading или сильный текст
-                        if title == "Без названия":
-                            possible_title = link.locator("xpath=..//span | ..//div[contains(@class, 'title')] | ..//h2 | ..//h3").first
-                            if await possible_title.count() > 0:
-                                title_text = await possible_title.inner_text()
-                                if title_text.strip():
-                                    title = title_text.strip()
-
-                        # Вариант 3: самый общий fallback (любой видимый текст внутри карточки)
-                        if title == "Без названия" or len(title) < 3:
-                            card = link.locator("xpath=ancestor::div[contains(@class, 'card') or contains(@class, 'item')]").first
-                            if await card.count() > 0:
-                                all_text = await card.inner_text()
-                                lines = [line.strip() for line in all_text.split('\n') if line.strip()]
-                                if lines:
-                                    title = lines[0]  # обычно первое — название
+                        title = await _extract_app_title(link)
 
                         found_apps.append({"app_id": app_id, "title": title})
 
@@ -104,17 +151,22 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
             if app["app_id"] not in unique_apps:
                 unique_apps[app["app_id"]] = app
 
-        deduplicated_apps = list(unique_apps.values())
+        deduplicated_apps = sorted(unique_apps.values(), key=lambda app: app["app_id"])
 
-        # Сравнение с БД
-        known = get_known_apps(developer_id, country)
-        new_apps = [app for app in deduplicated_apps if app["app_id"] not in known]
+        # Обновляем БД по текущей стране для всех найденных app_id
+        for app in deduplicated_apps:
+            save_new_app(developer_id, country, app["app_id"], app["title"])
 
-        if new_apps:
-            logger.success(f"✅ НАЙДЕНО НОВЫХ приложений у {developer_id} ({country}): {len(new_apps)} (всего уникальных: {len(deduplicated_apps)})")
-            for app in new_apps:
-                save_new_app(developer_id, country, app["app_id"], app["title"])
-                await send_notification(
+        sent_count = 0
+        for app in deduplicated_apps:
+            # Глобальная дедупликация между странами + защита от гонок
+            # (за счёт unique ключа в таблице notified_apps).
+            if not reserve_notification(developer_id, app["app_id"]):
+                continue
+
+            sent_count += 1
+            try:
+                send_notification(
                     f"🆕 **Новая игра от издателя**\n"
                     f"Издатель: {developer_id}\n"
                     f"Страна: {country.upper()}\n"
@@ -122,5 +174,16 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
                     f"App ID: `{app['app_id']}`\n"
                     f"[Открыть →](https://play.google.com/store/apps/details?id={app['app_id']})"
                 )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить уведомление для {app['app_id']}: {e}")
+
+        if sent_count:
+            logger.success(
+                f"✅ Отправлено новых уведомлений у {developer_id} ({country}): "
+                f"{sent_count} (всего уникальных в стране: {len(deduplicated_apps)})"
+            )
         else:
-            logger.info(f"Новых приложений не найдено у {developer_id} ({country}). Всего уникальных приложений: {len(deduplicated_apps)}")
+            logger.info(
+                f"Новых уведомлений нет у {developer_id} ({country}). "
+                f"Всего уникальных приложений в стране: {len(deduplicated_apps)}"
+            )
