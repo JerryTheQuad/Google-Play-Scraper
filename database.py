@@ -18,6 +18,14 @@ def init_db():
             PRIMARY KEY (developer_id, country, app_id)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS notified_apps (
+            developer_id TEXT,
+            app_id TEXT,
+            first_notified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (developer_id, app_id)
+        )
+    ''')
     conn.commit()
     conn.close()
 
