@@ -65,23 +65,3 @@ def save_new_app(developer_id: str, country: str, app_id: str, title: str):
     ''', (developer_id, country, app_id, title, now, now, title))
     conn.commit()
     conn.close()
-
-
-def reserve_notification(developer_id: str, app_id: str) -> bool:
-    """
-    Атомарно резервирует уведомление.
-    Возвращает True только для самого первого уведомления
-    (developer_id, app_id), даже при параллельных задачах.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.execute(
-        '''
-        INSERT OR IGNORE INTO notified_apps (developer_id, app_id)
-        VALUES (?, ?)
-        ''',
-        (developer_id, app_id)
-    )
-    conn.commit()
-    inserted = cursor.rowcount == 1
-    conn.close()
-    return inserted

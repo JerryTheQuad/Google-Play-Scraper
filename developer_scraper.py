@@ -2,8 +2,7 @@
 import asyncio
 from playwright.async_api import async_playwright
 from loguru import logger
-import re
-from database import reserve_notification, save_new_app
+from database import get_known_apps, save_new_app
 from notifier import send_notification
 
 BAD_TITLE_MARKERS = {
@@ -17,21 +16,6 @@ BAD_TITLE_MARKERS = {
 def _is_bad_title(value: str) -> bool:
     normalized = " ".join(value.lower().split())
     return not normalized or normalized in BAD_TITLE_MARKERS
-
-
-def _clean_title(value: str) -> str:
-    cleaned = value.strip()
-    # Если есть кавычки, часто именно там лежит реальное название.
-    quoted = re.search(r'["“](.+?)["”]', cleaned)
-    if quoted and quoted.group(1).strip():
-        cleaned = quoted.group(1).strip()
-
-    # Часто Google Play отдаёт alt вроде: `Значок приложения App Name`
-    cleaned = re.sub(r'\bзначок приложения\b', "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r'\bapp icon\b', "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = cleaned.rstrip('"”').strip()
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    return cleaned
 
 
 async def _extract_app_title(link):
@@ -51,10 +35,8 @@ async def _extract_app_title(link):
 
         for attr in ("alt", "aria-label", "title"):
             value = await candidate_locator.get_attribute(attr)
-            if value:
-                cleaned = _clean_title(value)
-                if cleaned and not _is_bad_title(cleaned):
-                    return cleaned
+            if value and not _is_bad_title(value.strip()):
+                return value.strip()
 
     # 2) Заголовки и текстовые узлы карточки
     text_candidates = await link.locator(
@@ -62,7 +44,7 @@ async def _extract_app_title(link):
     ).all_inner_texts()
 
     for value in text_candidates:
-        cleaned = _clean_title(value)
+        cleaned = value.strip()
         if len(cleaned) >= 2 and not _is_bad_title(cleaned):
             return cleaned
 
@@ -72,9 +54,8 @@ async def _extract_app_title(link):
         all_text = await card.inner_text()
         lines = [line.strip() for line in all_text.split("\n") if line.strip()]
         for line in lines:
-            cleaned = _clean_title(line)
-            if len(cleaned) >= 2 and not _is_bad_title(cleaned):
-                return cleaned
+            if len(line) >= 2 and not _is_bad_title(line):
+                return line
 
     return "Без названия"
 
@@ -153,19 +134,18 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
 
         deduplicated_apps = sorted(unique_apps.values(), key=lambda app: app["app_id"])
 
-        # Обновляем БД по текущей стране для всех найденных app_id
-        for app in deduplicated_apps:
-            save_new_app(developer_id, country, app["app_id"], app["title"])
+        # Сравнение с БД
+        known = get_known_apps(developer_id, country)
+        new_apps = [app for app in deduplicated_apps if app["app_id"] not in known]
 
-        sent_count = 0
-        for app in deduplicated_apps:
-            # Глобальная дедупликация между странами + защита от гонок
-            # (за счёт unique ключа в таблице notified_apps).
-            if not reserve_notification(developer_id, app["app_id"]):
-                continue
+        if new_apps:
+            logger.success(f"✅ НАЙДЕНО НОВЫХ приложений у {developer_id} ({country}): {len(new_apps)} (всего уникальных: {len(deduplicated_apps)})")
+            notified_ids = set()
+            for app in new_apps:
+                if app["app_id"] in notified_ids:
+                    continue
 
-            sent_count += 1
-            try:
+                save_new_app(developer_id, country, app["app_id"], app["title"])
                 send_notification(
                     f"🆕 **Новая игра от издателя**\n"
                     f"Издатель: {developer_id}\n"
@@ -174,16 +154,6 @@ async def scrape_developer_page(developer_id: str, country: str, lang: str, sema
                     f"App ID: `{app['app_id']}`\n"
                     f"[Открыть →](https://play.google.com/store/apps/details?id={app['app_id']})"
                 )
-            except Exception as e:
-                logger.warning(f"Не удалось отправить уведомление для {app['app_id']}: {e}")
-
-        if sent_count:
-            logger.success(
-                f"✅ Отправлено новых уведомлений у {developer_id} ({country}): "
-                f"{sent_count} (всего уникальных в стране: {len(deduplicated_apps)})"
-            )
+                notified_ids.add(app["app_id"])
         else:
-            logger.info(
-                f"Новых уведомлений нет у {developer_id} ({country}). "
-                f"Всего уникальных приложений в стране: {len(deduplicated_apps)}"
-            )
+            logger.info(f"Новых приложений не найдено у {developer_id} ({country}). Всего уникальных приложений: {len(deduplicated_apps)}")
