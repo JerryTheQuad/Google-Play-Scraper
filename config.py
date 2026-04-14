@@ -33,5 +33,5 @@ LANG = "ru"                    # язык интерфейса Play Store
 SCAN_INTERVAL_HOURS = 12       # 2 раза в день
 
 # Telegram (создайте бота у @BotFather)
-TELEGRAM_BOT_TOKEN = "8678375056:AAGxkGR7ZjDmCtOIGV_kYPlVh4pJqZPB5Ws"
-TELEGRAM_CHAT_ID = "703529738"   # ваш личный ID или группа
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""   # ваш личный ID или группа
